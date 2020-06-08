@@ -31,6 +31,11 @@ const (
 	VlanImport          = "vlan"
 )
 
+// Elementer is an interface for commits.
+type Elementer interface {
+	Element() interface{}
+}
+
 // XapiClient is the interface that describes an pango.Client.
 type XapiClient interface {
 	String() string
@@ -53,7 +58,7 @@ type XapiClient interface {
 	VsysImport(string, string, string, string, []string) error
 	VsysUnimport(string, string, string, []string) error
 	WaitForJob(uint, interface{}) error
-	Commit(string, []string, bool, bool, bool, bool) (uint, error)
+	Commit(interface{}, string, interface{}) (uint, []byte, error)
 	PositionFirstEntity(int, string, string, []string, []string) error
 }
 
@@ -422,11 +427,36 @@ type JobResponse struct {
 // BasicJob is a struct for parsing minimal information about a submitted
 // job to PANOS.
 type BasicJob struct {
-	XMLName  xml.Name `xml:"response"`
-	Result   string   `xml:"result>job>result"`
-	Progress uint     `xml:"result>job>progress"`
-	Details  []string `xml:"result>job>details>line"`
-	Devices  []devJob `xml:"result>job>devices>entry"`
+	XMLName  xml.Name        `xml:"response"`
+	Result   string          `xml:"result>job>result"`
+	Progress uint            `xml:"result>job>progress"`
+	Details  BasicJobDetails `xml:"result>job>details"`
+	Devices  []devJob        `xml:"result>job>devices>entry"`
+}
+
+type BasicJobDetails struct {
+	Lines []LineOrCdata `xml:"line"`
+}
+
+func (o *BasicJobDetails) String() string {
+	ans := make([]string, 0, len(o.Lines))
+
+	for _, line := range o.Lines {
+		if line.Cdata != nil {
+			ans = append(ans, strings.TrimSpace(*line.Cdata))
+		} else if line.Text != nil {
+			ans = append(ans, *line.Text)
+		} else {
+			ans = append(ans, "huh")
+		}
+	}
+
+	return strings.Join(ans, " | ")
+}
+
+type LineOrCdata struct {
+	Cdata *string `xml:",cdata"`
+	Text  *string `xml:",chardata"`
 }
 
 // Internally used by BasicJob for panorama commit-all.
@@ -446,3 +476,7 @@ const (
 	MoveTop
 	MoveBottom
 )
+
+type Actioner interface {
+	Action() string
+}

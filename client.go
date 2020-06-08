@@ -3,6 +3,7 @@ package pango
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,36 +54,44 @@ const (
 // invoke Initialize() to prepare it for use.
 type Client struct {
 	// Connection properties.
-	Hostname string
-	Username string
-	Password string
-	ApiKey   string
-	Protocol string
-	Port     uint
-	Timeout  int
-	Target   string
+	Hostname string `json:"hostname"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	ApiKey   string `json:"api_key"`
+	Protocol string `json:"protocol"`
+	Port     uint   `json:"port"`
+	Timeout  int    `json:"timeout"`
+	Target   string `json:"target"`
+
+	// Set to true if you want to check environment variables
+	// for auth and connection properties.
+	CheckEnvironment bool `json:"-"`
 
 	// HTTP transport options.  Note that the VerifyCertificate setting is
 	// only used if you do not specify a HTTP transport yourself.
-	VerifyCertificate bool
-	Transport         *http.Transport
+	VerifyCertificate bool            `json:"verify_certificate"`
+	Transport         *http.Transport `json:"-"`
 
 	// Variables determined at runtime.
-	Version    version.Number
-	SystemInfo map[string]string
-	Plugin     []map[string]string
+	Version        version.Number      `json:"-"`
+	SystemInfo     map[string]string   `json:"-"`
+	Plugin         []map[string]string `json:"-"`
+	MultiConfigure *MultiConfigure     `json:"-"`
 
 	// Logging level.
-	Logging uint32
+	Logging               uint32   `json:"-"`
+	LoggingFromInitialize []string `json:"logging"`
 
 	// Internal variables.
-	con     *http.Client
-	api_url string
+	credsFile string
+	con       *http.Client
+	api_url   string
 
 	// Variables for testing, response bytes and response index.
-	rp []url.Values
-	rb [][]byte
-	ri int
+	rp              []url.Values
+	rb              [][]byte
+	ri              int
+	authFileContent []byte
 }
 
 // String is the string representation of a client connection.  Both the
@@ -144,6 +155,21 @@ func (c *Client) Initialize() error {
 	}
 
 	return nil
+}
+
+// InitializeUsing does Initialize(), but takes in a filename that contains
+// fallback authentication credentials if they aren't specified.
+//
+// The order of preference for auth / connection settings is:
+//
+// * explicitly set
+// * environment variable (set chkenv to true to enable this)
+// * json file
+func (c *Client) InitializeUsing(filename string, chkenv bool) error {
+	c.CheckEnvironment = chkenv
+	c.credsFile = filename
+
+	return c.Initialize()
 }
 
 // RetrieveApiKey retrieves the API key, which will require that both the
@@ -405,53 +431,6 @@ func (c *Client) UnlockCommits(vsys, admin string) error {
 	return err
 }
 
-// Commit performs a standard commit on this PAN-OS device.
-//
-// Param desc is the optional commit description message you want associated
-// with the commit.
-//
-// Param admins is advanced options for doing partial commit admin-level changes,
-// include the administrator name in the request.
-//
-// Params dan and pao are advanced options for doing partial commits.  Setting
-// param dan to false excludes the Device and Network configuration, while
-// setting param pao to false excludes the Policy and Object configuration.
-//
-// Param force is if you want to force a commit even if no changes are
-// required.
-//
-// Param sync should be true if you want this function to block until the
-// commit job completes.
-//
-// Commits result in a job being submitted to the backend.  The job ID and
-// if an error was encountered or not are returned from this function.  If
-// the job ID returned is 0, then no commit was needed.
-func (c *Client) Commit(desc string, admins []string, dan, pao, force, sync bool) (uint, error) {
-	c.LogAction("(commit) %q", desc)
-
-	req := baseCommit{Description: desc}
-	if len(admins) > 0 || !dan || !pao {
-		req.Partial = &baseCommitPartial{}
-		if !dan {
-			req.Partial.Dan = "excluded"
-		}
-		if !pao {
-			req.Partial.Pao = "excluded"
-		}
-		req.Partial.Admin = util.StrToMem(admins)
-	}
-	if force {
-		req.Force = ""
-	}
-
-	job, _, err := c.CommitConfig(req, "", nil)
-	if err != nil || !sync || job == 0 {
-		return job, err
-	}
-
-	return job, c.WaitForJob(job, nil)
-}
-
 // WaitForJob polls the device, waiting for the specified job to finish.
 //
 // If you want to unmarshal the response into a struct, then pass in a
@@ -518,8 +497,8 @@ func (c *Client) WaitForJob(id uint, resp interface{}) error {
 
 	// Check the results for a failed commit.
 	if ans.Result == "FAIL" {
-		if len(ans.Details) > 0 {
-			return fmt.Errorf(ans.Details[0])
+		if len(ans.Details.Lines) > 0 {
+			return fmt.Errorf(ans.Details.String())
 		} else {
 			return fmt.Errorf("Job %d has failed to complete successfully", id)
 		}
@@ -732,7 +711,7 @@ func (c *Client) Show(path, extras, ans interface{}) ([]byte, error) {
 	c.logXpath(xp)
 	data.Set("xpath", xp)
 
-	return c.typeConfig("show", data, extras, ans)
+	return c.typeConfig("show", data, nil, extras, ans)
 }
 
 // Get runs a "get" type command.
@@ -753,7 +732,7 @@ func (c *Client) Get(path, extras, ans interface{}) ([]byte, error) {
 	c.logXpath(xp)
 	data.Set("xpath", xp)
 
-	return c.typeConfig("get", data, extras, ans)
+	return c.typeConfig("get", data, nil, extras, ans)
 }
 
 // Delete runs a "delete" type command, removing the supplied xpath and
@@ -775,7 +754,7 @@ func (c *Client) Delete(path, extras, ans interface{}) ([]byte, error) {
 	c.logXpath(xp)
 	data.Set("xpath", xp)
 
-	return c.typeConfig("delete", data, extras, ans)
+	return c.typeConfig("delete", data, nil, extras, ans)
 }
 
 // Set runs a "set" type command, creating the element at the given xpath.
@@ -794,17 +773,12 @@ func (c *Client) Delete(path, extras, ans interface{}) ([]byte, error) {
 // Any response received from the server is returned, along with any errors
 // encountered.
 func (c *Client) Set(path, element, extras, ans interface{}) ([]byte, error) {
-	var err error
 	data := url.Values{}
 	xp := util.AsXpath(path)
 	c.logXpath(xp)
 	data.Set("xpath", xp)
 
-	if err = addToData("element", element, true, &data); err != nil {
-		return nil, err
-	}
-
-	return c.typeConfig("set", data, extras, ans)
+	return c.typeConfig("set", data, element, extras, ans)
 }
 
 // Edit runs a "edit" type command, modifying what is at the given xpath
@@ -824,17 +798,12 @@ func (c *Client) Set(path, element, extras, ans interface{}) ([]byte, error) {
 // Any response received from the server is returned, along with any errors
 // encountered.
 func (c *Client) Edit(path, element, extras, ans interface{}) ([]byte, error) {
-	var err error
 	data := url.Values{}
 	xp := util.AsXpath(path)
 	c.logXpath(xp)
 	data.Set("xpath", xp)
 
-	if err = addToData("element", element, true, &data); err != nil {
-		return nil, err
-	}
-
-	return c.typeConfig("edit", data, extras, ans)
+	return c.typeConfig("edit", data, element, extras, ans)
 }
 
 // Move does a "move" type command.
@@ -852,7 +821,7 @@ func (c *Client) Move(path interface{}, where, dst string, extras, ans interface
 		data.Set("dst", dst)
 	}
 
-	return c.typeConfig("move", data, extras, ans)
+	return c.typeConfig("move", data, nil, extras, ans)
 }
 
 // Rename does a "rename" type command.
@@ -863,7 +832,21 @@ func (c *Client) Rename(path interface{}, newname string, extras, ans interface{
 	data.Set("xpath", xp)
 	data.Set("newname", newname)
 
-	return c.typeConfig("rename", data, extras, ans)
+	return c.typeConfig("rename", data, nil, extras, ans)
+}
+
+// MultiConfig does a "multi-config" type command.
+//
+// Note that the error returned from this function is only if there was an error
+// unmarshaling the response into the the multi config response struct.  If the
+// multi config itself failed, then the reason can be found in its results.
+func (c *Client) MultiConfig(element MultiConfigure, extras interface{}) ([]byte, MultiConfigureResponse, error) {
+	data := url.Values{}
+
+	resp := MultiConfigureResponse{}
+	text, _ := c.typeConfig("multi-config", data, element, extras, nil)
+	err := xml.Unmarshal(text, &resp)
+	return text, resp, err
 }
 
 // Uid performs User-ID API calls.
@@ -921,13 +904,14 @@ func (c *Client) Import(cat, content, filename, fp string, extras map[string]str
 	return c.CommunicateFile(content, filename, fp, data, ans)
 }
 
-// CommitConfig performs PAN-OS commits.  This is the underlying function
-// invoked by Firewall.Commit() and Panorama.Commit().
+// Commit performs PAN-OS commits.
 //
-// The cmd param can be either a properly formatted XML string or a struct
-// that can be marshalled into XML.
+// The cmd param can be a properly formatted XML string, a struct that can
+// be marshalled into XML, or one of the commit types.
 //
-// The action param is the commit action to be taken, if any (e.g. - "all").
+// The action param is the commit action to be taken (e.g. - "all").  If the
+// cmd param is one of the commit types, and the action passed in to this function
+// is an empty string, then the action will be determined by the commit type.
 //
 // The extras param should be either nil or a url.Values{} to be mixed in with
 // the constructed request.
@@ -935,7 +919,7 @@ func (c *Client) Import(cat, content, filename, fp string, extras map[string]str
 // Commits result in a job being submitted to the backend.  The job ID, assuming
 // the commit action was successfully submitted, the response from the server,
 // and if an error was encountered or not are all returned from this function.
-func (c *Client) CommitConfig(cmd interface{}, action string, extras interface{}) (uint, []byte, error) {
+func (c *Client) Commit(cmd interface{}, action string, extras interface{}) (uint, []byte, error) {
 	var err error
 	data := url.Values{}
 	data.Set("type", "commit")
@@ -946,6 +930,8 @@ func (c *Client) CommitConfig(cmd interface{}, action string, extras interface{}
 
 	if action != "" {
 		data.Set("action", action)
+	} else if ca, ok := cmd.(util.Actioner); ok && ca.Action() != "" {
+		data.Set("action", ca.Action())
 	}
 
 	if c.Target != "" {
@@ -966,34 +952,178 @@ func (c *Client) CommitConfig(cmd interface{}, action string, extras interface{}
 func (c *Client) initCon() error {
 	var tout time.Duration
 
-	// Sets the logging level.
-	if c.Logging == 0 {
-		c.Logging = LogAction | LogUid
+	// Load up the JSON config file.
+	json_client := &Client{}
+	if c.credsFile != "" {
+		var (
+			b   []byte
+			err error
+		)
+		if len(c.rb) == 0 {
+			b, err = ioutil.ReadFile(c.credsFile)
+		} else {
+			b, err = c.authFileContent, nil
+		}
+
+		if err != nil {
+			return err
+		}
+
+		if err = json.Unmarshal(b, &json_client); err != nil {
+			return err
+		}
 	}
 
-	// Set the timeout
-	if c.Timeout == 0 {
-		c.Timeout = 10
-	} else if c.Timeout > 60 {
-		return fmt.Errorf("Timeout for %q is %d, expecting a number between [0, 60]", c.Hostname, c.Timeout)
+	// Hostname.
+	if c.Hostname == "" {
+		if val := os.Getenv("PANOS_HOSTNAME"); c.CheckEnvironment && val != "" {
+			c.Hostname = val
+		} else {
+			c.Hostname = json_client.Hostname
+		}
 	}
-	tout = time.Duration(time.Duration(c.Timeout) * time.Second)
 
-	// Set the protocol
+	// Username.
+	if c.Username == "" {
+		if val := os.Getenv("PANOS_USERNAME"); c.CheckEnvironment && val != "" {
+			c.Username = val
+		} else {
+			c.Username = json_client.Username
+		}
+	}
+
+	// Password.
+	if c.Password == "" {
+		if val := os.Getenv("PANOS_PASSWORD"); c.CheckEnvironment && val != "" {
+			c.Password = val
+		} else {
+			c.Password = json_client.Password
+		}
+	}
+
+	// API key.
+	if c.ApiKey == "" {
+		if val := os.Getenv("PANOS_API_KEY"); c.CheckEnvironment && val != "" {
+			c.ApiKey = val
+		} else {
+			c.ApiKey = json_client.ApiKey
+		}
+	}
+
+	// Protocol.
 	if c.Protocol == "" {
-		c.Protocol = "https"
-	} else if c.Protocol != "http" && c.Protocol != "https" {
+		if val := os.Getenv("PANOS_PROTOCOL"); c.CheckEnvironment && val != "" {
+			c.Protocol = val
+		} else if json_client.Protocol != "" {
+			c.Protocol = json_client.Protocol
+		} else {
+			c.Protocol = "https"
+		}
+	}
+	if c.Protocol != "http" && c.Protocol != "https" {
 		return fmt.Errorf("Invalid protocol %q.  Must be \"http\" or \"https\"", c.Protocol)
 	}
 
-	// Check port number
+	// Port.
+	if c.Port == 0 {
+		if val := os.Getenv("PANOS_PORT"); c.CheckEnvironment && val != "" {
+			if cp, err := strconv.Atoi(val); err != nil {
+				return fmt.Errorf("Failed to parse the env port number: %s", err)
+			} else {
+				c.Port = uint(cp)
+			}
+		} else if json_client.Port != 0 {
+			c.Port = json_client.Port
+		}
+	}
 	if c.Port > 65535 {
 		return fmt.Errorf("Port %d is out of bounds", c.Port)
 	}
 
-	// Setup the https client
+	// Timeout.
+	if c.Timeout == 0 {
+		if val := os.Getenv("PANOS_TIMEOUT"); c.CheckEnvironment && val != "" {
+			if ival, err := strconv.Atoi(val); err != nil {
+				return fmt.Errorf("Failed to parse timeout env var as int: %s", err)
+			} else {
+				c.Timeout = ival
+			}
+		} else if json_client.Timeout != 0 {
+			c.Timeout = json_client.Timeout
+		} else {
+			c.Timeout = 10
+		}
+	}
+	if c.Timeout <= 0 || c.Timeout > 60 {
+		return fmt.Errorf("Timeout for %q is %d, expecting a number between [0, 60]", c.Hostname, c.Timeout)
+	}
+	tout = time.Duration(time.Duration(c.Timeout) * time.Second)
+
+	// Target.
+	if c.Target == "" {
+		if val := os.Getenv("PANOS_TARGET"); c.CheckEnvironment && val != "" {
+			c.Target = val
+		} else {
+			c.Target = json_client.Target
+		}
+	}
+
+	// Verify cert.
+	if !c.VerifyCertificate {
+		if val := os.Getenv("PANOS_VERIFY_CERTIFICATE"); c.CheckEnvironment && val != "" {
+			if vcb, err := strconv.ParseBool(val); err != nil {
+				return err
+			} else if vcb {
+				c.VerifyCertificate = vcb
+			}
+		}
+		if !c.VerifyCertificate && json_client.VerifyCertificate {
+			c.VerifyCertificate = json_client.VerifyCertificate
+		}
+	}
+
+	// Logging.
+	if c.Logging == 0 {
+		var ll []string
+		if val := os.Getenv("PANOS_LOGGING"); c.CheckEnvironment && val != "" {
+			ll = strings.Split(val, ",")
+		} else {
+			ll = json_client.LoggingFromInitialize
+		}
+		if len(ll) > 0 {
+			var lv uint32
+			for _, x := range ll {
+				switch x {
+				case "quiet":
+					lv |= LogQuiet
+				case "action":
+					lv |= LogAction
+				case "query":
+					lv |= LogQuery
+				case "op":
+					lv |= LogOp
+				case "uid":
+					lv |= LogUid
+				case "xpath":
+					lv |= LogXpath
+				case "send":
+					lv |= LogSend
+				case "receive":
+					lv |= LogReceive
+				default:
+					return fmt.Errorf("Unknown logging requested: %s", x)
+				}
+			}
+			c.Logging = lv
+		} else {
+			c.Logging = LogAction | LogUid
+		}
+	}
+
+	// Setup the https client.
 	if c.Transport == nil {
 		c.Transport = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: !c.VerifyCertificate,
 			},
@@ -1002,6 +1132,13 @@ func (c *Client) initCon() error {
 	c.con = &http.Client{
 		Transport: c.Transport,
 		Timeout:   tout,
+	}
+
+	// Sanity check.
+	if c.Hostname == "" {
+		return fmt.Errorf("No hostname specified")
+	} else if c.ApiKey == "" && (c.Username == "" && c.Password == "") {
+		return fmt.Errorf("No username/password or API key given")
 	}
 
 	// Configure the api url
@@ -1068,11 +1205,32 @@ func (c *Client) initSystemInfo() error {
 	return nil
 }
 
-func (c *Client) typeConfig(action string, data url.Values, extras, ans interface{}) ([]byte, error) {
+func (c *Client) typeConfig(action string, data url.Values, element, extras, ans interface{}) ([]byte, error) {
 	var err error
+
+	if c.MultiConfigure != nil && (action == "set" ||
+		action == "edit" ||
+		action == "delete") {
+		r := MultiConfigureRequest{
+			Command: action,
+			Xpath:   data.Get("xpath"),
+		}
+		if element != nil {
+			r.Data = element
+		}
+		c.MultiConfigure.Reqs = append(c.MultiConfigure.Reqs, r)
+		return nil, nil
+	}
 
 	data.Set("type", "config")
 	data.Set("action", action)
+
+	if element != nil {
+		if err = addToData("element", element, true, &data); err != nil {
+			return nil, err
+		}
+	}
+
 	if c.Target != "" {
 		data.Set("target", c.Target)
 	}
@@ -1307,6 +1465,50 @@ func (c *Client) PositionFirstEntity(mvt int, rel, ent string, path, elms []stri
 	return err
 }
 
+// Clock gets the time on the PAN-OS appliance.
+func (c *Client) Clock() (time.Time, error) {
+	type t_req struct {
+		XMLName xml.Name `xml:"show"`
+		Cmd     string   `xml:"clock"`
+	}
+
+	type t_resp struct {
+		Result string `xml:"result"`
+	}
+
+	req := t_req{}
+	ans := t_resp{}
+
+	c.LogOp("(op) getting system time")
+	if _, err := c.Op(req, "", nil, &ans); err != nil {
+		return time.Time{}, err
+	}
+
+	return time.Parse(time.UnixDate+"\n", ans.Result)
+}
+
+// PrepareMultiConfigure will start a multi config command.
+//
+// Capacity is the initial capacity of the requests to be sent.
+func (c *Client) PrepareMultiConfigure(capacity int) {
+	c.MultiConfigure = &MultiConfigure{
+		Reqs: make([]MultiConfigureRequest, 0, capacity),
+	}
+}
+
+// SendMultiConfigure will send the accumulated multi configure request.
+func (c *Client) SendMultiConfigure() (MultiConfigureResponse, error) {
+	if c.MultiConfigure == nil {
+		return MultiConfigureResponse{}, nil
+	}
+
+	mc := c.MultiConfigure
+	c.MultiConfigure = nil
+
+	_, ans, err := c.MultiConfig(*mc, nil)
+	return ans, err
+}
+
 /** Non-struct private functions **/
 
 func mergeUrlValues(data *url.Values, extras interface{}) error {
@@ -1341,13 +1543,19 @@ func addToData(key string, i interface{}, attemptMarshal bool, data *url.Values)
 }
 
 func asString(i interface{}, attemptMarshal bool) (string, error) {
+	if a, ok := i.(fmt.Stringer); ok {
+		return a.String(), nil
+	}
+
+	if b, ok := i.(util.Elementer); ok {
+		i = b.Element()
+	}
+
 	switch val := i.(type) {
-	case string:
-		return val, nil
-	case fmt.Stringer:
-		return val.String(), nil
 	case nil:
 		return "", fmt.Errorf("nil encountered")
+	case string:
+		return val, nil
 	default:
 		if !attemptMarshal {
 			return "", fmt.Errorf("value must be string or fmt.Stringer")
@@ -1485,17 +1693,4 @@ type configLocks struct {
 
 type commitLocks struct {
 	Locks []util.Lock `xml:"result>commit-locks>entry"`
-}
-
-type baseCommit struct {
-	XMLName     xml.Name           `xml:"commit"`
-	Description string             `xml:"description,omitempty"`
-	Partial     *baseCommitPartial `xml:"partial"`
-	Force       interface{}        `xml:"force"`
-}
-
-type baseCommitPartial struct {
-	Dan   string           `xml:"device-and-network,omitempty"`
-	Pao   string           `xml:"policy-and-objects,omitempty"`
-	Admin *util.MemberType `xml:"admin"`
 }
